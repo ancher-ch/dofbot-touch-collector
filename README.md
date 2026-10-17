@@ -56,6 +56,13 @@ cd software
 python3 -m unittest discover
 ```
 
-建议安装官方Gitleaks后扫描历史与工作区。克隆后执行 git config core.hooksPath .githooks 启用本地提交检查；缺少Gitleaks会拒绝提交。GitHub CI使用只读权限、固定提交版本的Actions，并校验扫描工具SHA256；只运行模拟测试，不连接机械臂。参考 [Gitleaks](https://github.com/gitleaks/gitleaks) 和 [GitHub防泄漏说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)。
+建议安装官方Gitleaks后扫描历史与工作区。Ubuntu/Linux首次启用本地提交检查时，先授予钩子可执行权限，再配置钩子目录：
+
+```bash
+chmod +x .githooks/pre-commit
+git config core.hooksPath .githooks
+```
+
+尤其是网页上传或ZIP解压得到的副本，不要假设已有可执行权限。启用后，缺少Gitleaks会拒绝提交。GitHub CI使用只读权限、固定提交版本的Actions，并校验扫描工具SHA256；只运行模拟测试，不连接机械臂。参考 [Gitleaks](https://github.com/gitleaks/gitleaks) 和 [GitHub防泄漏说明](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/removing-sensitive-data-from-a-repository)。
 
 工程借鉴LeRobot的观测/动作分离、后台取帧和episode管理思路，复用本机Qt/FFmpeg/Arm_Lib适配；未声称获得LeRobot或厂家认证，详见 software/touch_collector/REFERENCES.md。未捆绑厂家SDK。仓库尚未指定开源许可证，公开或进一步再分发时应由维护者确定许可。
