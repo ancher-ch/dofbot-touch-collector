@@ -13,7 +13,7 @@ def desktop_entry(kit, real):
     escaped = str(launcher).replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$').replace('%', '%%')
     title = 'DOFBOT 采集台 · 真机' if real else 'DOFBOT 采集台 · 模拟'
     return ('[Desktop Entry]\nType=Application\nVersion=1.0\n'
-            f'Name={title}\nComment=DOFBOT data collector v0.1.7.post1\n'
+            f'Name={title}\nComment=DOFBOT data collector v0.1.15\n'
             f'Exec=/bin/sh "{escaped}"\n'
             'Icon=applications-engineering\nTerminal=false\nCategories=Education;Science;\nStartupNotify=true\n')
 

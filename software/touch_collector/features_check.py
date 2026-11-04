@@ -47,6 +47,21 @@ def main():
         QtCore.QTimer.singleShot(80,configure);QtTest.QTest.mouseClick(window.camera_settings,QtCore.Qt.LeftButton)
         wait(lambda:not worker.pending and worker.camera_config['mode']=='dual')
         checks.append('dual_selection_requires_fixed_arm_confirmation')
+        wait(lambda:set(e.preview_frames)=={'wrist','overview'})
+        window.update_state();app.processEvents()
+        for role in ('wrist','overview'):
+            assert window.preview_panels[role].isVisible()
+            assert not window.preview_labels[role].pixmap().isNull()
+        shot('01b_dual_live_preview')
+        # A failed second preview is cleared while the primary remains visible.
+        secondary=e.camera.cameras['overview']
+        with patch.object(secondary,'get',side_effect=RuntimeError('second camera disconnected')):
+            wait(lambda:'overview' in e.preview_errors)
+            assert 'disconnected' in window.preview_labels['overview'].text()
+            assert not window.preview_labels['wrist'].pixmap().isNull()
+            shot('01c_second_preview_disconnected')
+        wait(lambda:set(e.preview_frames)=={'wrist','overview'})
+        checks.append('independent_dual_preview_and_secondary_error_without_stale_image')
         document=teaching();e.store.write_teaching(document);e.teaching=document;e.home=document['reference_pose'][:]
         e.stage='saved_teach';e.holding='confirmed';e.persist();window.update_state()
         assert worker.submit('replay_capture',confirmed=True)

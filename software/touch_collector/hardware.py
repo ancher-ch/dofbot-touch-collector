@@ -16,6 +16,10 @@ class PacedBus:
         self.gap=gap
         self.last_end=0.
         self.transactions=0
+        self.pending_query=None
+        self.reply_deadline=None
+        self.reply_wait=.003
+        self.feedback_trace=[]
 
     def call(self, name, *args):
         time.sleep(max(0,self.gap-(time.monotonic()-self.last_end)))
@@ -25,9 +29,41 @@ class PacedBus:
             self.last_end=time.monotonic()
             self.transactions+=1
 
-    def write_byte_data(self,*args): return self.call("write_byte_data",*args)
-    def write_i2c_block_data(self,*args): return self.call("write_i2c_block_data",*args)
-    def read_word_data(self,*args): return self.call("read_word_data",*args)
+    def write_byte_data(self,*args):
+        self.pending_query=None
+        result=self.call("write_byte_data",*args)
+        if len(args)==3 and args[0]==0x15 and args[1] in range(0x31,0x37) and args[2]==0:
+            self.pending_query=(args[0],args[1],self.last_end)
+        return result
+
+    def write_i2c_block_data(self,*args):
+        self.pending_query=None
+        return self.call("write_i2c_block_data",*args)
+
+    def read_word_data(self,*args):
+        pending=self.pending_query
+        self.pending_query=None
+        if pending is None or tuple(args)!=pending[:2]:
+            return self.call("read_word_data",*args)
+        ready_at=pending[2]+self.reply_wait
+        if self.reply_deadline is not None:
+            ready_at=min(ready_at,self.reply_deadline)
+        words=[];error=None
+        try:
+            time.sleep(max(0,ready_at-time.monotonic()))
+            value=self.call("read_word_data",*args)
+            words.append(value)
+            # Keep the manufacturer's one-query/one-read protocol. Never poll
+            # a consumed reply register or return a previous measurement.
+            return value
+        except OSError as exc:
+            error=type(exc).__name__
+            raise
+        finally:
+            self.feedback_trace.append({"joint":args[1]-0x30,"words":words,
+                "requested_wait_ms":self.reply_wait*1000,
+                "elapsed_ms":round((time.monotonic()-pending[2])*1000,3),"io_error":error})
+            self.feedback_trace=self.feedback_trace[-24:]
     def read_byte_data(self,*args): return self.call("read_byte_data",*args)
     def close(self): self.bus.close()
 
@@ -49,15 +85,52 @@ class RealRobot:
         self.position_requests = 0
         self.torque_requests = 0
 
-    def read(self):
+    def read_with_bounds(self, bounds):
+        return self.read(bounds)
+
+    def read(self, bounds=None):
+        bus=getattr(self.arm,"bus",None)
+        paced=isinstance(bus,PacedBus)
+        self.last_feedback_io=[]
+        if paced:
+            bus.feedback_trace=[]
+            bus.reply_deadline=time.monotonic()+.100
+        try:
+            return self._read(bounds)
+        finally:
+            if paced:
+                self.last_feedback_io=bus.feedback_trace[:]
+                bus.reply_deadline=None
+                bus.reply_wait=.003
+
+    def _read(self, bounds=None):
+        self.last_read_rechecks = []
+        bus=getattr(self.arm,"bus",None)
+        paced=isinstance(bus,PacedBus)
         pose, hints, reasons = [], [], []
         for j in range(1, 7):
+            if paced:bus.reply_wait=.003
             value = self.arm.Arm_serial_servo_read(j)
-            # A single transient reply must not destroy an entire teaching. Bound the
-            # retry to one per joint; never substitute a cached/clamped angle.
+            first = value
+            outside = bounds is not None and value is not None and not bounds[j-1][0] <= value <= bounds[j-1][1]
             if value is None:
-                time.sleep(.003)
+                # Every attempt is a fresh SDK query and its normal validation.
+                # Only failed reads pay the larger turnaround; no blind resends
+                # of position/torque commands and no use of diagnostic angles.
+                for wait in (.006,.010):
+                    if paced:
+                        if bus.reply_deadline is not None and time.monotonic()>=bus.reply_deadline:
+                            break
+                        bus.reply_wait=wait
+                    else:time.sleep(.003)
+                    value = self.arm.Arm_serial_servo_read(j)
+                    if value is not None:break
+            elif outside:
+                if paced:bus.reply_wait=.006
+                else:time.sleep(.003)
                 value = self.arm.Arm_serial_servo_read(j)
+                self.last_read_rechecks.append({"joint":j,"first":first,"confirmed":value,
+                                               "bounds":list(bounds[j-1])})
             pose.append(value)
             hint = None
             reason = None

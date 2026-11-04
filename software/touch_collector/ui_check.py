@@ -77,6 +77,16 @@ def main():
         wait(lambda:worker.engine is not None and worker.engine.valid)
         assert worker.engine.robot.torques+worker.engine.robot.writes == []
         assert worker.engine.home is None
+        custom_task = "从多个方块中抓起蓝色方块，放进固定盒子"
+        def enter_task():
+            dialog = app.activeModalWidget()
+            assert dialog.objectName() == "taskEditor"
+            dialog.edit.setText(custom_task)
+            QtTest.QTest.mouseClick(dialog.save, QtCore.Qt.LeftButton)
+        QtCore.QTimer.singleShot(100, enter_task)
+        click(window.task_edit)
+        wait(lambda:not worker.pending and worker.engine.task == custom_task)
+        assert window.task.currentText() == custom_task
         click(window.set_home_btn,True)
         wait(lambda:not worker.pending and worker.engine.stage=="home_setup")
         shot("00_home_setup")
@@ -96,6 +106,8 @@ def main():
         wait(lambda:not worker.pending and worker.engine.stage=="prepare")
         click(window.actions["begin"])
         wait(lambda:worker.engine.stage=="teaching")
+        assert worker.engine.teaching["task"] == custom_task
+        assert not window.task_edit.isEnabled()
         wait(lambda:len(worker.engine.teaching["samples"])>=4)
         worker.submit("demo_nudge",joint=4,delta=3)
         wait(lambda:not worker.pending)
@@ -114,6 +126,8 @@ def main():
         click(window.actions["replay"],True)
         wait(lambda:not worker.pending and worker.engine.stage=="capture_review",30)
         assert worker.engine.capture.meta["status"]=="draft",worker.engine.message
+        assert worker.engine.capture.meta["task"] == custom_task
+        assert window.task.currentText() == custom_task
         shot("04_capture_review")
         count = len(worker.engine.robot.writes)
         def close_preview():
@@ -167,6 +181,7 @@ def main():
                   "screenshots":str(args.shots),"episode":saved_episode,
                   "frames":saved_frames,"return_release_teach_cycles":3,
                   "four_degree_start_difference_allowed":True,"fast_gripper_reviewed_and_saved":True}
+        report["custom_task_in_teaching_and_capture"] = custom_task
         (args.shots/"ui_report.json").write_text(json.dumps(report,indent=2))
         print(json.dumps(report,indent=2))
     finally:

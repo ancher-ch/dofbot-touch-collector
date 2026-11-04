@@ -151,7 +151,7 @@ class Worker:
                 time.sleep(.05)
             save_json(self.root/'camera_config.json',config)
             e.camera=candidate;self.camera_config=config
-            e.preview=None;e.camera_error='';e.message='相机模式已切换；未发送机械臂指令。'
+            e.preview=None;e.preview_frames={};e.preview_errors={};e.camera_error='';e.message='相机模式已切换；未发送机械臂指令。'
         except BaseException as error:
             if candidate:
                 try:candidate.close()
@@ -199,15 +199,16 @@ class Worker:
         e = self.engine
         if e is None:
             raise RuntimeError("设备未连接。")
+        if name == "task":
+            # Metadata-only: don't clear a pending stop or alter actuator state.
+            e.set_task(kwargs["task"])
+            return
         if name not in ('check_feedback','reset_emergency','task'):
             self.safety.require_clear()
         e.stop.clear()
         e.error = ""
         e.feedback_command_failed = False
-        if name == "task":
-            e._idle()
-            e.task = kwargs["task"]
-        elif name == "demo_nudge":
+        if name == "demo_nudge":
             if self.demo and e.holding == "free":
                 j = kwargs["joint"]
                 maximum = 270 if j == 4 else 180
@@ -341,6 +342,7 @@ class Window(W.QMainWindow):
         self.last_library = None
         self.last_preview = None
         self.replay_gripper_extra = 1
+        self.replay_joint3_offset = 0
         self.setWindowTitle("DOFBOT 数据采集台 v" + __version__ + (" · 模拟模式" if worker.demo else ""))
         self.resize(1280,800)
         self.setMinimumSize(1120,740)
@@ -399,7 +401,7 @@ class Window(W.QMainWindow):
         n.addWidget(self.library,1)
         self.counts = label("0 条完整数据", wrap=True)
         n.addWidget(self.counts)
-        n.addWidget(label("离线运行 · 数据保存在本机", wrap=True))
+        n.addWidget(label("离线运行 · 数据保存在 cyh", wrap=True))
         body.addWidget(nav)
         main = W.QWidget()
         m = W.QVBoxLayout(main)
@@ -450,12 +452,20 @@ class Window(W.QMainWindow):
         self.camera_settings=W.QPushButton('单/双摄')
         self.camera_settings.clicked.connect(self.camera_dialog);camera_head.addWidget(self.camera_settings)
         l.addLayout(camera_head)
-        self.preview = label("等待相机画面", wrap=True)
-        self.preview.setAlignment(QtCore.Qt.AlignCenter)
-        self.preview.setMinimumSize(320,130)
-        self.preview.setSizePolicy(W.QSizePolicy.Ignored,W.QSizePolicy.Ignored)
-        self.preview.setStyleSheet("background:#e4ece9;border-radius:10px;color:#67818a;")
-        l.addWidget(self.preview,1)
+        views=W.QHBoxLayout();views.setSpacing(8)
+        self.preview_panels={};self.preview_labels={};self.preview_titles={}
+        for role,title in (('wrist','主相机 / 腕部'),('overview','第二相机 / 外部')):
+            panel=W.QWidget();layout=W.QVBoxLayout(panel);layout.setContentsMargins(0,0,0,0);layout.setSpacing(4)
+            heading=label(title,'subtitle');layout.addWidget(heading)
+            preview=label('等待相机画面',wrap=True);preview.setAlignment(QtCore.Qt.AlignCenter)
+            preview.setMinimumSize(130,100)
+            preview.setSizePolicy(W.QSizePolicy.Ignored,W.QSizePolicy.Ignored)
+            preview.setStyleSheet('background:#e4ece9;border-radius:10px;color:#67818a;')
+            layout.addWidget(preview,1);views.addWidget(panel,1)
+            self.preview_panels[role]=panel;self.preview_labels[role]=preview;self.preview_titles[role]=heading
+        self.preview=self.preview_labels['wrist']
+        self.preview_panels['overview'].hide()
+        l.addLayout(views,1)
         self.camera_note = label("预览不会保存；只在自动回放阶段采集RGB。", "subtitle", True)
         l.addWidget(self.camera_note)
         self.home_text = label("初始状态：尚未设置", "homeText", True)
@@ -463,7 +473,7 @@ class Window(W.QMainWindow):
         home_buttons = W.QHBoxLayout()
         self.set_home_btn = W.QPushButton("手动设置初始位置")
         self.set_home_btn.clicked.connect(self.set_home)
-        self.home_btn = W.QPushButton("5秒内回初始")
+        self.home_btn = W.QPushButton("快速回初始")
         self.home_btn.clicked.connect(self.home)
         home_buttons.addWidget(self.set_home_btn)
         home_buttons.addWidget(self.home_btn)
@@ -474,9 +484,19 @@ class Window(W.QMainWindow):
         c.setContentsMargins(18,15,18,15)
         c.setSpacing(8)
         self.task = W.QComboBox()
-        self.task.addItems(["把方块抓起放进固定盒子", "空载抓取路径测试", "关节小幅往返测试"])
-        self.task.currentTextChanged.connect(lambda t: self.send("task", task=t))
-        c.addWidget(self.task)
+        from .tasks import DEFAULT_TASKS
+        self.task.addItems(DEFAULT_TASKS)
+        self.task.setMinimumWidth(0)
+        self.task.setSizePolicy(W.QSizePolicy.Expanding, W.QSizePolicy.Fixed)
+        self.task.setSizeAdjustPolicy(W.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.task.setMinimumContentsLength(10)
+        self.task.activated[str].connect(lambda text: self.send("task", task=text))
+        self.task_edit = W.QPushButton("编辑任务")
+        self.task_edit.clicked.connect(self.edit_task)
+        task_row = W.QHBoxLayout()
+        task_row.addWidget(self.task, 1)
+        task_row.addWidget(self.task_edit)
+        c.addLayout(task_row)
         self.message = label("正在连接设备……", "message", True)
         self.message.setMinimumHeight(44)
         c.addWidget(self.message)
@@ -575,6 +595,15 @@ class Window(W.QMainWindow):
         if self.worker.submit(name, **kwargs):
             self.update_state()
 
+    def edit_task(self):
+        from .task_ui import TaskDialog
+        state = self.state()
+        if not state or not self.task_edit.isEnabled():
+            return
+        dialog = TaskDialog(state["task"], self)
+        if dialog.exec_() == W.QDialog.Accepted:
+            self.send("task", task=dialog.name())
+
     def confirm(self, title, text, checks, accept_text="确认执行"):
         dialog = W.QDialog(self)
         dialog.setWindowTitle(title)
@@ -652,22 +681,24 @@ class Window(W.QMainWindow):
             reviewed=True
         self.send("save_teaching",reviewed=reviewed)
 
-    def motion_confirm(self, replay, gripper_extra_degrees=0):
+    def motion_confirm(self, replay, gripper_extra_degrees=0, joint3_offset_degrees=0):
         s = self.state()
         target=s["teaching_start"] if s and replay else (s["home"] if s else None)
         if not s or not s["valid"] or target is None:
             return False
         try:
             if replay:
-                plan,_=teaching_plan(self.worker.engine.teaching,gripper_extra_degrees)
+                plan,_=teaching_plan(self.worker.engine.teaching,gripper_extra_degrees,joint3_offset_degrees)
                 target=plan[0]
-            home_plan(s["pose"], target)
+            return_plan = home_plan(s["pose"], target)
         except (ValueError, RuntimeError) as error:
             self.confirm("回位计划不能执行", str(error), [])
             return False
-        text = f"当前：{s['pose']}\n{'本条示教起点' if replay else '初始位置'}：{target}\n采用同步平滑回位：运动约4.5秒，随后检查；3秒倒计时另计。\n软件限速30°/s不是硬件额定值，小步运动不能避障。"
+        return_seconds = (len(return_plan)-1)/10
+        text = f"当前：{s['pose']}\n{'本条示教起点' if replay else '初始位置'}：{target}\n同步平滑回位：预计运动约{return_seconds:.1f}秒，按距离自动调整；3秒倒计时另计。\n超过5秒会继续按计划回位，不因此取消；反馈异常或停止操作仍会中断。\n软件限速30°/s不是硬件额定值，沿途需清空；本软件不能避障。"
         if replay:
             text += f"\n夹爪夹紧补偿：{gripper_extra_degrees}°；最大张开角保持，最闭合处增加所选角度，中间平滑过渡。"
+            text += f"\nJ3位置微调：{joint3_offset_degrees:+d}°，作用于本条回放及其起点；不修改全局初始位置。正负不是固定的上下方向，不是力矩重力补偿。"
             text += "\n回位后再次倒计时，再自动执行示教并录视频。回位路径应与方块、盒子留出空间。"
         return self.confirm("回初始并回放采集" if replay else "回到初始状态", text,
                             ["已抱紧，手和支撑已退出整条运动路径", "沿途无遮挡，线缆有余量；回位时夹爪为空"])
@@ -684,12 +715,23 @@ class Window(W.QMainWindow):
         layout.setContentsMargins(28,24,28,24)
         layout.setSpacing(18)
         layout.addWidget(label("回放夹爪补偿", "title"))
-        layout.addWidget(label("建议先试1°。示教原始角度保留，补偿只用于本次回放；最大张开角不变，最闭合处增加所选角度，中间平滑过渡。\n这是位置补偿，没有力反馈；若持续嗡鸣、物体变形或异常发热，请停止，不要继续增加。",wrap=True))
+        description=label("建议先试1°。示教原始角度保留，补偿只用于本次回放；最大张开角不变，最闭合处增加所选角度，中间平滑过渡。\n这是位置补偿，没有力反馈；若持续嗡鸣、物体变形或异常发热，请停止，不要继续增加。",wrap=True)
+        description.setObjectName("compensationDescription")
+        description.setMinimumHeight(110)
+        layout.addWidget(description)
         choice=W.QComboBox()
         choice.setObjectName("gripperCompensation")
-        choice.addItems(["0° · 原始示教角度","1° · 夹紧多1°（建议先试）","2° · 夹紧多2°"])
+        choice.addItems(["0° · 原始示教角度","1° · 夹紧多1°（建议先试）",*[f"{n}° · 夹紧多{n}°" for n in range(2,6)]])
         choice.setCurrentIndex(self.replay_gripper_extra)
         layout.addWidget(choice)
+        layout.addWidget(label("J3位置微调（不是力矩重力补偿）",wrap=True))
+        joint3=W.QComboBox()
+        joint3.setObjectName("joint3Correction")
+        for offset in range(-3,4):
+            joint3.addItem("0° · 不微调（默认）" if not offset else f"{offset:+d}° · J3目标角度微调",offset)
+        joint3.setCurrentIndex(joint3.findData(self.replay_joint3_offset))
+        layout.addWidget(joint3)
+        layout.addWidget(label("J3仅改变回放目标角度，原始示教保留；正负方向需要现场验证。不能靠微调消除舵机不响应或机构卡住。",wrap=True))
         buttons=W.QHBoxLayout()
         cancel=W.QPushButton("取消")
         accept=W.QPushButton("下一步：检查回放路径",objectName="primary")
@@ -700,8 +742,10 @@ class Window(W.QMainWindow):
             return
         extra=choice.currentIndex()
         self.replay_gripper_extra=extra
-        if self.motion_confirm(True,extra):
-            self.send("replay_capture", confirmed=True,gripper_extra_degrees=extra)
+        offset=joint3.currentData()
+        self.replay_joint3_offset=offset
+        if self.motion_confirm(True,extra,offset):
+            self.send("replay_capture", confirmed=True,gripper_extra_degrees=extra,joint3_offset_degrees=offset)
 
     def discard(self):
         if self.confirm("删除并重新示教", "所选人工示教及当前未保存采集将移入回收站。此前已保存的完整数据保留。此操作不改变扭矩。", []):
@@ -798,6 +842,8 @@ class Window(W.QMainWindow):
         self.manager_btn.setEnabled(self.saved_videos_btn.isEnabled())
         self.camera_settings.setEnabled(bool(s) and not self.worker.pending and not viewing and not latched and s['activity']=='idle' and s['stage'] not in ('teaching','home_setup') and s['holding'] not in ('free','pending'))
         if s is None:
+            self.task.setEnabled(False)
+            self.task_edit.setEnabled(False)
             self.connection.setText("设备未连接")
             self.message.setText(self.worker.error)
             self.warning.setText("未连接时不能发送控制指令。软件不会自动接管或移动机械臂。")
@@ -892,7 +938,23 @@ class Window(W.QMainWindow):
             if key == "save_teach":
                 enable = enable and self.worker.engine.teaching and self.worker.engine.teaching["status"] == "draft"
             b.setEnabled(bool(enable))
-        self.task.setEnabled(not busy and s["stage"] in ("ready","prepare"))
+        task_enabled = not busy and s["stage"] in ("ready", "prepare") and not self.worker.engine.teaching and not self.worker.engine.capture
+        self.task.setEnabled(task_enabled)
+        self.task_edit.setEnabled(task_enabled)
+        # The engine owns the applied name, including restored historical work.
+        choices = s["task_history"]
+        if choices != [self.task.itemText(i) for i in range(self.task.count())]:
+            blocker = QtCore.QSignalBlocker(self.task)
+            self.task.clear()
+            self.task.addItems(choices)
+            self.task.setCurrentText(s["task"])
+            del blocker
+        elif self.task.currentText() != s["task"]:
+            blocker = QtCore.QSignalBlocker(self.task)
+            self.task.setCurrentText(s["task"])
+            del blocker
+        self.task.setToolTip(s["task"])
+        self.task_edit.setToolTip("输入新任务名称，只用于之后的新示教。" if task_enabled else "已有数据请先保存，再点下一条人工示教后编辑任务。")
         self.hold_button.setVisible(s["holding"] in ("free","unknown") and (not connected or s["stage"] not in ("teaching","home_setup")))
         self.hold_button.setText("异常时尝试抱紧" if not connected else "当前位置抱紧")
         self.hold_button.setEnabled(not busy)
@@ -910,13 +972,22 @@ class Window(W.QMainWindow):
             streams=camera_status['streams']
             camera_note=f'双摄 主{streams["wrist"]["fps"]:.1f} / 外{streams["overview"]["fps"]:.1f}fps · '+('稳定' if camera_status['ready'] else '预热 / 异常')
         self.camera_note.setText(s["camera_error"] or camera_note)
-        if s["preview"] and s["preview"] != self.last_preview:
-            pix = QtGui.QPixmap()
-            if pix.loadFromData(s["preview"], "JPG"):
-                self.preview.setPixmap(pix.scaled(self.preview.size(),QtCore.Qt.KeepAspectRatio,QtCore.Qt.SmoothTransformation))
-            self.last_preview = s["preview"]
-        elif s["camera_error"]:
-            self.preview.setText("相机暂不可用\n"+s["camera_error"])
+        dual=bool(camera_status and camera_status.get('mode')=='dual')
+        self.preview_panels['overview'].setVisible(dual)
+        frames=s.get('preview_frames') or ({'wrist':s['preview']} if s.get('preview') else {})
+        errors=s.get('preview_errors',{})
+        for role,preview in self.preview_labels.items():
+            if role=='overview' and not dual:
+                preview.clear();continue
+            stream=(camera_status or {}).get('streams',{}).get(role,{})
+            title='主相机 / 腕部' if role=='wrist' else '第二相机 / 外部'
+            self.preview_titles[role].setText(title+(f' · {stream["fps"]:.1f} fps' if 'fps' in stream else ''))
+            data=frames.get(role)
+            pix=QtGui.QPixmap()
+            if data and pix.loadFromData(data,'JPG'):
+                preview.setPixmap(pix.scaled(preview.size(),QtCore.Qt.KeepAspectRatio,QtCore.Qt.SmoothTransformation))
+            else:
+                preview.setText('相机暂不可用\n'+errors[role] if role in errors else '等待相机画面')
         items = [(x["id"],x["status"],x.get("samples_count",0)) for x in s["library"] if x["status"] == "recorded"]
         if items != self.last_library:
             self.library.clear()
@@ -979,7 +1050,7 @@ def main():
     app.setApplicationName("DOFBOT 数据采集台")
     app.setFont(QtGui.QFont("Noto Sans CJK SC",11))
     import hashlib
-    server_name = "dofbot_collector_"+hashlib.sha256((str(root.resolve())+str(args.demo)).encode()).hexdigest()[:16]
+    server_name = "cyh_dofbot_"+hashlib.sha256((str(root.resolve())+str(args.demo)).encode()).hexdigest()[:16]
     socket = QtNetwork.QLocalSocket()
     socket.connectToServer(server_name)
     if socket.waitForConnected(150):

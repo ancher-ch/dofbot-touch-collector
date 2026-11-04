@@ -1,8 +1,8 @@
 # DOFBOT Touch Collector
 
-DOFBOT-PRO 本机触屏数据采集台，Python / PyQt5，GitHub分发修订 **v0.1.7.post1**。
+DOFBOT-PRO 本机触屏数据采集台，Python / PyQt5，GitHub分发修订 **v0.1.15**。
 
-手动示教只记录关节；自动回放时记录 RGB、真实关节状态和实际执行目标，人工审核后保存原始 episode。支持初始姿态、单/双RGB配置、夹爪0/1/2°补偿、视频浏览、数据管理、软删除/恢复、ZIP导出和持久化软件急停。
+手动示教只记录关节；自动回放时记录 RGB、真实关节状态和实际执行目标，人工审核后保存原始 episode。支持初始姿态、单/双RGB配置、夹爪0～5°位置补偿、J3 ±3°位置微调、视频浏览、数据管理、软删除/恢复、ZIP导出和持久化软件急停。
 
 ## 先读
 
@@ -13,7 +13,7 @@ DOFBOT-PRO 本机触屏数据采集台，Python / PyQt5，GitHub分发修订 **v
 
 **适配环境：** DOFBOT-PRO、Jetson Ubuntu22.04、Python3.10、厂家Arm_Lib、I2C bus7。不是通用6轴驱动，不是Windows安装程序。厂家SDK和系统依赖不随仓库分发。
 
-**实体双摄仍待验证。** 现有单摄硬件是带深度能力的Orbbec，但软件只保存RGB，不保存深度/IR。原始MP4+JSONL不是直接可训练的LeRobot v3数据集。
+已在一台设备上测试双摄RGB采集；软件只保存RGB，不保存深度/IR。原始MP4+JSONL不是直接可训练的LeRobot v3数据集。
 
 ## 从模拟开始
 

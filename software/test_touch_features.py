@@ -6,12 +6,13 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch,Mock
 import zipfile
 from touch_collector.safety import EmergencyLatch
 from touch_collector.core import Engine
 from touch_collector.hardware import DemoRobot
-from touch_collector.multicamera import CameraRig,ViewSample,validate_config
+from touch_collector.multicamera import CameraRig,ViewSample,validate_config,discover_devices
+from touch_collector.camera import CameraReadinessError,CameraFrameError
 from touch_collector.management import DatasetManager
 from touch_collector.storage import Capture,Store,load
 from trajectory_teach import save_json
@@ -74,6 +75,63 @@ class PairCamera:
     def close(self):pass
 
 class CameraTests(unittest.TestCase):
+    def test_frame_failure_identifies_secondary_and_retains_failed_age(self):
+        rig=self.make_rig()
+        self.b.read_latest=Mock(side_effect=CameraFrameError('最新图像过旧',
+            {'frame_age_ms':67.,'max_age_ms':50,'sequence':31,'observed_monotonic_ns':self.now}))
+        with self.assertRaises(CameraFrameError) as caught:rig.get_for_tick()
+        self.assertIn('第二/外部相机',str(caught.exception))
+        self.assertIn('67.0ms',str(caught.exception))
+        self.assertEqual(caught.exception.diagnostics['role'],'overview')
+        self.assertEqual(caught.exception.diagnostics['sequence'],31)
+        self.assertEqual(rig.last_sequences,{})
+
+    def test_runtime_failure_identifies_secondary_and_does_not_reset_pair_history(self):
+        rig=self.make_rig();rig.get_for_tick();before=dict(rig.last_sequences)
+        status={'ready':False,'fps':30.,'p95_interval_ms':33.4,'max_interval_ms':42.9,
+                'latest_frame_age_ms':150.,'not_ready_reasons':['最新帧超过100ms或时间异常']}
+        self.b.check_recording=Mock(side_effect=CameraReadinessError(status,'采集中'))
+        with self.assertRaises(CameraReadinessError) as caught:rig.next_recording_tick(self.a.sample)
+        self.assertEqual(caught.exception.diagnostics['role'],'overview')
+        self.assertIn('第二/外部相机',str(caught.exception))
+        self.assertNotIn('未开始',str(caught.exception))
+        self.assertEqual(rig.last_sequences,before)
+
+    def test_discovery_excludes_depth_ir_and_metadata_nodes(self):
+        import struct
+        import types
+        nodes=[Path('/dev/video'+str(i)) for i in range(5)]
+        formats={0:[b'MJPG',b'YUYV'],1:[b'Z16 '],2:[b'GREY',b'NV12'],3:[b'BA81',b'YV12'],4:[b'MJPG']}
+        def ioctl(fd,request,buf):
+            if request==0x80685600:
+                buf[16:22]=b'Camera';struct.pack_into('I',buf,84,0 if fd==4 else 1)
+            else:
+                index=struct.unpack_from('I',buf)[0]
+                if index>=len(formats[fd]):raise OSError('no more formats')
+                buf[44:48]=formats[fd][index]
+        with patch.dict('sys.modules',{'fcntl':types.SimpleNamespace(ioctl=ioctl)}), \
+             patch('touch_collector.multicamera.os.O_NONBLOCK',2048,create=True), \
+             patch('pathlib.Path.glob',lambda p,pattern:nodes if p.as_posix()=='/dev' else []), \
+             patch('touch_collector.multicamera.os.open',side_effect=lambda p,flags:int(p.name[5:])), \
+             patch('touch_collector.multicamera.os.close'), \
+             patch('touch_collector.multicamera.physical_camera_id',return_value='usb-camera'):
+            found=discover_devices()
+        self.assertEqual([Path(x['node']).as_posix() for x in found],['/dev/video0'])
+        self.assertEqual(found[0]['formats'],['MJPG','YUYV'])
+
+    def test_two_interfaces_on_same_physical_camera_are_rejected(self):
+        devices=[{'path':'/dev/video0','identity':'usb-a'},{'path':'/dev/video2','identity':'usb-a'}]
+        with self.assertRaisesRegex(ValueError,'实体'):
+            validate_config({'mode':'dual','wrist':'/dev/video0','overview':'/dev/video2'},devices)
+
+    def test_preview_keeps_healthy_view_when_secondary_fails_but_recording_stops(self):
+        rig=self.make_rig()
+        self.b.read_latest=Mock(side_effect=RuntimeError('second camera disconnected'))
+        views,errors=rig.preview_views()
+        self.assertEqual(views,{'wrist':self.a.sample})
+        self.assertIn('overview',errors)
+        with self.assertRaisesRegex(RuntimeError,'disconnected'):rig.get_for_tick()
+
     def make_rig(self):
         now=time.monotonic_ns();self.now=now
         self.a=PairCamera(10,now-10_000_000);self.b=PairCamera(20,now-20_000_000)

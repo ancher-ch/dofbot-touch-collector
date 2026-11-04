@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest.mock import patch, Mock
 
-from touch_collector.core import Engine, home_plan, Stopped, teaching_plan, compensated_teaching
+from touch_collector.core import Engine, home_plan, Stopped, teaching_plan, compensated_teaching, joint3_corrected_teaching
 from touch_collector.hardware import DemoRobot, RealRobot, FeedbackError, PacedBus
 from touch_collector.storage import Store, Capture, load
 from trajectory_teach import save_json
@@ -51,7 +51,7 @@ class CollectorTests(unittest.TestCase):
 
     def test_gripper_extra_changes_only_replay_copy_and_preserves_widest_opening(self):
         source=self.gripping_teaching();before=copy.deepcopy(source)
-        for extra in (1,2):
+        for extra in (1,2,3,4,5):
             adjusted,policy=compensated_teaching(source,extra)
             self.assertEqual(source,before)
             self.assertEqual(min(r["q"][5] for r in adjusted["samples"]),100)
@@ -68,8 +68,56 @@ class CollectorTests(unittest.TestCase):
         self.assertIs(compensated_teaching(source,0)[0],source)
         self.assertEqual(teaching_plan(source),teaching_plan(source,0))
 
+    def test_joint3_micro_correction_changes_only_joint3_and_raw_source_is_preserved(self):
+        source=self.gripping_teaching();before=copy.deepcopy(source)
+        for offset in (-3,-1,0,1,3):
+            adjusted,policy=joint3_corrected_teaching(source,offset)
+            self.assertEqual(source,before)
+            self.assertFalse(policy['gravity_compensation'])
+            for old,new in zip(source['samples'],adjusted['samples']):
+                self.assertEqual(new['q'][2],old['q'][2]+offset)
+                self.assertEqual(new['q'][:2]+new['q'][3:],old['q'][:2]+old['q'][3:])
+            plan,_=teaching_plan(source,3,offset)
+            self.assertEqual(plan[0][2],35+offset)
+            self.assertEqual(max(q[5] for q in plan),137)
+            self.assertEqual(plan[-1][5],100)
+
+    def test_joint3_rejects_invalid_offsets_and_never_clips_or_repairs_bad_source(self):
+        source=self.gripping_teaching()
+        for offset in (-4,4,True,1.,None):
+            with self.assertRaises(ValueError):teaching_plan(source,0,offset)
+        for q,offset in ((0,-1),(180,1),(-1,1)):
+            source['samples'][0]['q'][2]=q
+            with self.assertRaises(ValueError):teaching_plan(source,0,offset)
+
+    @patch('touch_collector.core.time.sleep')
+    def test_joint3_capture_actions_and_metadata_match_without_global_home_change(self,_sleep):
+        source=self.gripping_teaching();before=copy.deepcopy(source)
+        self.e.teaching=source;self.e.holding='confirmed'
+        self.robot.pose=source['samples'][0]['q'][:]
+        self.e.home=self.robot.pose[:];home=self.e.home[:]
+        with patch.object(Capture,'encode'):
+            self.e.replay_capture(True,gripper_extra_degrees=3,joint3_offset_degrees=2)
+        rows=[json.loads(x) for x in (self.e.capture.path/'samples.jsonl').read_text().splitlines()]
+        self.assertTrue(all(r['action'][2]==37 for r in rows))
+        self.assertEqual(self.e.capture.meta['joint3_position_correction']['offset_degrees'],2)
+        self.assertFalse(self.e.capture.meta['joint3_position_correction']['gravity_compensation'])
+        self.assertEqual(self.e.home,home)
+        self.assertEqual(load(self.e.capture.path/'teaching.json'),before)
+        self.assertEqual(self.e.teaching,before)
+        self.assertEqual(self.robot.torques,[])
+
+    def test_bad_joint3_offset_fails_before_any_return_or_capture(self):
+        self.install_teaching()
+        self.e.teaching['samples'][0]['q'][2]=0
+        with patch.object(self.e,'return_home') as back:
+            with self.assertRaises(ValueError):self.e.replay_capture(True,joint3_offset_degrees=-1)
+        back.assert_not_called()
+        self.assertEqual(self.robot.writes+self.robot.torques,[])
+        self.assertIsNone(self.e.capture)
+
     def test_compensated_gripper_plan_still_caps_steps_and_reaches_closed_target(self):
-        for extra in (1,2):
+        for extra in (1,2,3,4,5):
             plan,_=teaching_plan(self.gripping_teaching(),extra)
             self.assertEqual(max(q[5] for q in plan),134+extra)
             self.assertEqual(plan[0][5],100)
@@ -77,7 +125,7 @@ class CollectorTests(unittest.TestCase):
             self.assertTrue(all(max(abs(a-b) for a,b in zip(x,y))<=2 for x,y in zip(plan,plan[1:])))
 
     def test_compensation_rejects_invalid_options_and_too_small_open_close_span(self):
-        for extra in (-1,3,1.0,True,None,float('nan')):
+        for extra in (-1,6,1.0,True,None,float('nan')):
             with self.subTest(extra=extra),self.assertRaises(ValueError):
                 teaching_plan(self.gripping_teaching(),extra)
         source=self.gripping_teaching()
@@ -93,6 +141,15 @@ class CollectorTests(unittest.TestCase):
             teaching_plan(source,2)
         source["samples"][4]["q"][5]=181
         with self.assertRaises(ValueError):teaching_plan(source,1)
+
+    def test_five_degree_compensation_checks_sdk_boundary_without_clipping(self):
+        source=self.gripping_teaching()
+        source['samples'][4]['q'][5]=175
+        adjusted,policy=compensated_teaching(source,5)
+        self.assertEqual(max(r['q'][5] for r in adjusted['samples']),180)
+        self.assertEqual(policy['max_extra_degrees'],5)
+        source['samples'][4]['q'][5]=176
+        with self.assertRaises(ValueError):teaching_plan(source,5)
 
     @patch('touch_collector.core.time.sleep')
     def test_compensated_capture_records_actual_sent_goals_and_unchanged_source(self,_sleep):
@@ -142,6 +199,89 @@ class CollectorTests(unittest.TestCase):
         self.e = Engine(self.robot,self.root/"data",self.root/"session.json",FakeCamera(),FakeCV(),True)
     def tearDown(self):
         self.folder.cleanup()
+
+    def test_task_name_validates_and_normalizes_without_motor_io(self):
+        from touch_collector.tasks import task_name
+        self.assertEqual(task_name("  把蓝色方块\n 放进盒子  "), "把蓝色方块 放进盒子")
+        for value in ("", "  ", None, 3, "a\x00b", "a"*201):
+            with self.assertRaises(ValueError):
+                self.e.set_task(value)
+        self.assertEqual(self.robot.writes+self.robot.torques, [])
+
+    def test_task_clipboard_repair_handles_gbk_and_utf8_without_changing_valid_names(self):
+        from touch_collector.tasks import clipboard_repair_candidates, SEQUENCE_TASK
+        for encoding in ('gb18030','utf-8'):
+            for transport in ('latin1','cp1252'):
+                try:broken=SEQUENCE_TASK.encode(encoding).decode(transport)
+                except UnicodeError:continue
+                self.assertIn(SEQUENCE_TASK,clipboard_repair_candidates(broken))
+        for original in (SEQUENCE_TASK,'pick blue block','café',None,'\ufffd\ufffd'):
+            self.assertEqual(clipboard_repair_candidates(original),[])
+        self.assertEqual(self.robot.writes+self.robot.torques,[])
+
+    def test_task_is_persisted_with_history_and_restored(self):
+        first = "从多个方块中抓起蓝色方块，放进固定盒子"
+        self.e.set_task(first)
+        self.e.set_task("把红色方块放到红色区域")
+        self.e.set_task(first)
+        restored = Engine(DemoRobot(), self.e.store.root, self.root/"other_session.json", demo=True)
+        self.assertEqual(restored.task, first)
+        self.assertEqual(restored.snapshot()["task_history"].count(first), 1)
+        self.assertIn("把红色方块放到红色区域", restored.snapshot()["task_history"])
+        self.assertEqual(self.robot.writes+self.robot.torques, [])
+
+    def test_task_change_rejected_during_recording_review_and_motion(self):
+        self.e.set_task("原任务")
+        before = (self.e.store.root/"task_config.json").read_bytes()
+        for stage in ("teaching", "teach_review", "saved_teach", "capture_review", "home_setup"):
+            self.e.stage = stage
+            with self.assertRaises(RuntimeError):
+                self.e.set_task("不能更改")
+        self.e.stage = "ready"
+        self.e.activity = "returning"
+        with self.assertRaises(RuntimeError):
+            self.e.set_task("不能更改")
+        self.assertEqual((self.e.store.root/"task_config.json").read_bytes(), before)
+        self.assertEqual(self.e.task, "原任务")
+        self.assertEqual(self.robot.writes+self.robot.torques, [])
+
+    def test_task_write_failure_does_not_change_applied_name(self):
+        self.e.set_task("原任务")
+        with patch("touch_collector.core.save_json", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.e.set_task("新任务")
+        self.assertEqual(self.e.task, "原任务")
+        self.assertEqual(load(self.e.store.root/"task_config.json")["current"], "原任务")
+
+    def test_changing_next_task_preserves_old_teaching_and_episode_labels(self):
+        self.install_teaching()
+        capture = Capture(self.e.store, self.e.teaching, FakeCV())
+        paths = [self.e.store.item("teachings", "example")/"trajectory.json",
+                 self.e.store.item("teachings", "example")/"metadata.json", capture.path/"metadata.json"]
+        before = {p:p.read_bytes() for p in paths}
+        self.e.next_teaching()
+        self.e.set_task("抓蓝色方块")
+        for p in paths:
+            self.assertEqual(p.read_bytes(), before[p])
+
+    def test_new_teaching_and_capture_use_custom_task(self):
+        task = "从多个方块中抓起蓝色方块，放进固定盒子"
+        self.e.set_task(task)
+        self.e.stage = "prepare"
+        self.e.holding = "free"
+        self.e.begin_teaching()
+        self.assertEqual(self.e.teaching["task"], task)
+        self.assertEqual(load(self.e.store.item("teachings", self.e.teaching["id"])/"trajectory.json")["task"], task)
+        capture = Capture(self.e.store, self.e.teaching, FakeCV())
+        self.assertEqual(capture.meta["task"], task)
+        self.assertEqual(self.robot.writes+self.robot.torques, [])
+
+    def test_invalid_saved_task_config_does_not_break_startup(self):
+        for config in ({"current":"", "recent":[]}, {"current":"有效任务", "recent":False}, []):
+            save_json(self.e.store.root/"task_config.json", config)
+            restored = Engine(DemoRobot(), self.e.store.root, self.root/"other_session.json", demo=True)
+            self.assertEqual(restored.task, "把方块抓起放进固定盒子")
+
     def install_teaching(self):
         d = teaching()
         p = self.e.store.item("teachings",d["id"])
@@ -638,14 +778,81 @@ class CollectorTests(unittest.TestCase):
         self.assertTrue(load(self.e.session_path)["learning_may_be_active"])
         self.assertEqual(self.robot.writes,[])
 
-    def test_five_second_plan_is_smooth_and_refuses_large_span(self):
+    def test_return_plan_is_smooth_and_automatically_extends_for_large_span(self):
         plan = home_plan([70,51,26,20,90,131],[83,122,37,17,91,131])
         self.assertEqual(plan[0],[70,51,26,20,90,131])
         self.assertEqual(plan[-1],[83,122,37,17,91,131])
         self.assertEqual((len(plan)-1)/10,4.5)
         self.assertTrue(all(max(abs(a-b) for a,b in zip(x,y))<=4 for x,y in zip(plan,plan[1:])))
-        with self.assertRaises(ValueError):
-            home_plan([0]*6,[180,180,180,180,270,180])
+        largest = home_plan([0]*6,[180,180,180,180,270,180])
+        self.assertEqual((len(largest)-1)/10,16.9)
+        self.assertEqual(largest[-1],[180,180,180,180,270,180])
+
+    def test_reported_gripper_span_is_now_accepted_and_short_moves_are_faster(self):
+        start = [80,82,30,27,89,106]
+        target = [89,66,30,16,89,30]
+        plan = home_plan(start,target)
+        self.assertEqual((len(plan)-1)/10,4.8)
+        self.assertEqual(plan[0],start)
+        self.assertEqual(plan[-1],target)
+        short = home_plan([90]*6,[93,90,90,90,90,90])
+        self.assertEqual((len(short)-1)/10,1.0)
+
+    def test_return_timing_respects_analytic_limits_and_explicit_duration_is_not_a_cap(self):
+        for span in (0,3,10,71,76,80,90,180,270):
+            start=[0]*6;target=[0,0,0,0,span,0]
+            plan=home_plan(start,target,duration=1.0)
+            seconds=(len(plan)-1)/10
+            self.assertGreaterEqual(seconds,1.0)
+            self.assertLessEqual(1.875*span/seconds,30.0+1e-9)
+            self.assertLessEqual(5.774*span/seconds**2,90.0+1e-9)
+            self.assertTrue(all(max(abs(a-b) for a,b in zip(x,y))<=4 for x,y in zip(plan,plan[1:])))
+        for bad in (0,-1,float('nan'),float('inf'),True,'5'):
+            with self.subTest(bad=bad):
+                for name in ('duration','max_speed','max_acceleration'):
+                    with self.assertRaises(ValueError):home_plan([0]*6,[30]*6,**{name:bad})
+
+    def test_return_executes_past_five_seconds_without_changing_teaching_or_home(self):
+        class Clock:
+            t=0.
+            def sleep(self,seconds):self.t+=max(0,seconds)
+        clock=Clock()
+        self.install_teaching()
+        self.robot.pose=[90,120,35,25,90,130]
+        target=[90,30,35,25,90,30]
+        self.e.home=target[:];self.e.holding='confirmed'
+        home_file=self.e.store.root/'home.json'
+        save_json(home_file,{'pose':target})
+        source_file=self.e.store.item('teachings',self.e.teaching['id'])/'trajectory.json'
+        before=(home_file.read_bytes(),source_file.read_bytes())
+        with patch('touch_collector.core.time.monotonic',side_effect=lambda:clock.t),patch('touch_collector.core.time.sleep',side_effect=clock.sleep):
+            self.e.return_home(True,countdown=False)
+        self.assertGreater(self.e.elapsed,5.)
+        self.assertEqual(self.robot.pose,target)
+        self.assertEqual(self.robot.torques,[])
+        self.assertEqual(self.e.activity,'idle')
+        self.assertEqual(before,(home_file.read_bytes(),source_file.read_bytes()))
+        self.assertIn('6.3秒',self.e.message)
+        self.assertFalse(self.e.stop.is_set())
+
+    def test_long_return_still_stops_after_five_seconds_without_torque_change(self):
+        class Clock:
+            t=0.
+            def sleep(self,seconds):self.t+=max(0,seconds)
+        clock=Clock()
+        self.robot.pose=[90,120,35,25,90,130]
+        target=[90,30,35,25,90,30]
+        self.e.home=target[:];self.e.holding='confirmed'
+        original_write=self.robot.write
+        def write(q,duration):
+            original_write(q,duration)
+            if clock.t>=5:self.e.stop.set()
+        with patch('touch_collector.core.time.monotonic',side_effect=lambda:clock.t),patch('touch_collector.core.time.sleep',side_effect=clock.sleep),patch.object(self.robot,'write',side_effect=write):
+            with self.assertRaises(Stopped):self.e.return_home(True,countdown=False)
+        self.assertNotEqual(self.robot.pose,target)
+        self.assertEqual(self.robot.torques,[])
+        self.assertEqual(self.e.activity,'idle')
+        self.assertEqual(self.e.holding,'confirmed')
 
     @patch("touch_collector.core.time.sleep")
     def test_stop_event_prevents_first_motion_and_never_drops_torque(self,_sleep):
@@ -680,6 +887,77 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(commands[-1][1],target)
         self.assertEqual(self.e.pose,target)
 
+    def test_pending_goal_does_not_add_a_step_to_already_issued_tracking_error(self):
+        from touch_collector.tracking import command_bounds, failed_joints
+        actual=[50,80,24,18,87,98]
+        poses=[[52,80,24,17,88,97],[55,79,24,17,88,98],
+               [57,79,24,17,88,99],[60,79,24,17,88,99]]
+        history=[(1.1+i*.1,q) for i,q in enumerate(poses)]
+        bounds,recent,issued=command_bounds(history,1.5)
+        self.assertEqual(failed_joints(actual,bounds),[])
+        self.assertEqual(issued,poses[-1])
+        self.assertGreater(abs(actual[0]-63),12)  # Not-yet-issued goal caused old false failure.
+
+    def test_both_reported_snapshots_still_detect_real_gripper_nonfollowing(self):
+        from touch_collector.tracking import command_bounds, failed_joints, failure_text
+        cases=[([111,53,15,49,110,96], [111,53,16,49,110,103], [111,53,16,50,110,104]),
+               ([100,72,15,29,99,96], [98,76,16,25,97,102], [97,79,16,22,96,103])]
+        for actual,issued,pending in cases:
+            bounds,_,_=command_bounds([(0,issued)],.1)
+            self.assertIn(5,failed_joints(actual,bounds))
+            text=failure_text(actual,issued,pending,[5])
+            self.assertIn("J6夹爪",text)
+            self.assertIn("不等于夹紧成功",text)
+
+    def test_real_robot_rechecks_one_outlier_joint_without_clamping_or_writes(self):
+        robot=RealRobot.__new__(RealRobot)
+        robot.arm=Mock()
+        counts={j:0 for j in range(1,7)}
+        def angle(j):
+            counts[j]+=1
+            return (96 if counts[j]==1 else 104) if j==6 else 90
+        robot.arm.Arm_serial_servo_read.side_effect=angle
+        with patch('touch_collector.hardware.time.sleep'):
+            pose=robot.read_with_bounds([(87,93)]*5+[(101,107)])
+        self.assertEqual(pose,[90]*5+[104])
+        self.assertEqual(counts,{1:1,2:1,3:1,4:1,5:1,6:2})
+        self.assertEqual(robot.last_read_rechecks[0]['first'],96)
+        self.assertEqual(robot.last_read_rechecks[0]['confirmed'],104)
+        self.assertEqual([c[0] for c in robot.arm.method_calls],['Arm_serial_servo_read']*7)
+
+    def test_repeated_outlier_is_not_cached_clamped_or_accepted(self):
+        robot=RealRobot.__new__(RealRobot);robot.arm=Mock()
+        robot.arm.Arm_serial_servo_read.side_effect=lambda j:96 if j==6 else 90
+        with patch('touch_collector.hardware.time.sleep'):
+            pose=robot.read_with_bounds([(87,93)]*5+[(101,107)])
+        self.assertEqual(pose[-1],96)
+        self.assertEqual(robot.last_read_rechecks[-1]['confirmed'],96)
+
+    def test_return_settling_accepts_delayed_feedback_without_more_writes(self):
+        class Clock:
+            t=0.
+            def sleep(self,seconds):self.t+=max(0,seconds)
+        clock=Clock();pose=self.robot.pose[:];reads=0
+        def read():
+            nonlocal reads
+            reads+=1
+            result=pose[:]
+            if 3<=reads<=6:result[1]+=3
+            return result
+        with patch('touch_collector.core.time.monotonic',side_effect=lambda:clock.t),patch('touch_collector.core.time.monotonic_ns',side_effect=lambda:int(clock.t*1e9)),patch('touch_collector.core.time.sleep',side_effect=clock.sleep),patch.object(self.robot,'read',side_effect=read):
+            self.e._motion([pose])
+        self.assertGreaterEqual(clock.t,.4)
+        self.assertEqual(len(self.robot.writes),1)
+        self.assertEqual(self.robot.torques,[])
+
+    def test_stop_during_return_settling_prevents_further_commands(self):
+        pose=self.robot.pose[:]
+        def sleep(seconds):self.e.stop.set()
+        with patch('touch_collector.core.time.sleep',side_effect=sleep):
+            with self.assertRaises(Stopped):self.e._motion([pose])
+        self.assertLessEqual(len(self.robot.writes),1)
+        self.assertEqual(self.robot.torques,[])
+
     @patch("touch_collector.core.time.sleep")
     def test_repeated_targets_do_not_flood_bus_but_each_frame_is_recorded(self,_sleep):
         capture=Mock()
@@ -697,6 +975,58 @@ class CollectorTests(unittest.TestCase):
             self.e.replay_capture(True)
         self.assertEqual(self.robot.writes+self.robot.torques,[])
         self.assertIsNone(self.e.capture)
+
+    @patch('touch_collector.core.time.sleep')
+    def test_actual_frame_failure_preserves_diagnostics_in_failed_episode(self,_sleep):
+        from touch_collector.camera import CameraFrameError
+        self.install_teaching();self.e.holding='confirmed'
+        fault=CameraFrameError('最新图像过旧',{'frame_age_ms':67.,'max_age_ms':50,'sequence':31},'wrist')
+        before=len(self.robot.writes)
+        with patch.object(self.e,'return_home'),patch.object(self.e,'_countdown'), \
+             patch.object(self.e,'_motion',side_effect=fault):
+            with self.assertRaises(CameraFrameError):self.e.replay_capture(True)
+        self.e.fail(fault)
+        metadata=load(self.e.capture.path/'metadata.json')
+        self.assertEqual(metadata['status'],'error')
+        self.assertFalse(metadata['capture_checks_passed'])
+        self.assertEqual(metadata['camera_failure_diagnostics'],fault.diagnostics)
+        self.assertEqual(len(self.robot.writes),before)
+
+    @patch('touch_collector.core.time.sleep')
+    def test_camera_diagnostics_persist_in_failed_episode_and_event_without_more_writes(self,_sleep):
+        from touch_collector.camera import CameraReadinessError
+        self.install_teaching()
+        self.e.holding='confirmed'
+        fault=CameraReadinessError({'ready':False,'fps':30.,'p95_interval_ms':33.,
+              'max_interval_ms':42.9,'latest_frame_age_ms':150.,
+              'not_ready_reasons':['最新帧超过100ms或时间异常']},'采集中','overview')
+        before=len(self.robot.writes)
+        with patch.object(self.e,'return_home'),patch.object(self.e,'_countdown'), \
+             patch.object(self.e,'_motion',side_effect=fault):
+            with self.assertRaises(CameraReadinessError):self.e.replay_capture(True)
+        self.e.fail(fault)
+        metadata=load(self.e.capture.path/'metadata.json')
+        self.assertEqual(metadata['status'],'error')
+        self.assertFalse(metadata['capture_checks_passed'])
+        self.assertEqual(metadata['camera_failure_diagnostics']['role'],'overview')
+        events=[json.loads(x) for x in (self.e.store.root/'reports/events.jsonl').read_text(encoding='utf-8').splitlines()]
+        self.assertEqual(events[-1]['camera_failure_diagnostics'],fault.diagnostics)
+        self.assertEqual(len(self.robot.writes),before)
+
+    @patch('touch_collector.core.time.sleep')
+    def test_secondary_becoming_stale_before_feedback_is_rejected_before_command(self,_sleep):
+        from touch_collector.multicamera import ViewSample
+        from touch_collector.camera import CameraFrameError
+        camera=FakeCamera();camera.max_recording_age_ms=50
+        camera.recording_anchor=lambda:time.monotonic()
+        def sample(after):
+            now=time.monotonic_ns()
+            return ViewSample({'wrist':(1,now,object()),'overview':(2,now-70_000_000,object())})
+        camera.get_for_tick=sample;self.e.camera=camera
+        with self.assertRaises(CameraFrameError) as caught:
+            self.e._motion([self.robot.pose[:]]*2,Mock())
+        self.assertEqual(caught.exception.diagnostics['role'],'overview')
+        self.assertEqual(self.robot.writes+self.robot.torques,[])
 
     @patch('touch_collector.core.time.sleep')
     def test_synchronized_camera_rejects_old_image_before_first_write(self,_sleep):
@@ -765,6 +1095,90 @@ class CollectorTests(unittest.TestCase):
             bus.write_byte_data(0x15,0x32,0)
         self.assertTrue(all(b-a>=.00299 for a,b in zip(times,times[1:])))
         self.assertEqual(bus.transactions,3)
+
+    def test_zero_reply_is_returned_to_sdk_without_reading_consumed_register(self):
+        class Clock:
+            t=1.
+            def sleep(self,n):self.t+=max(0,n)
+        clock=Clock();raw=Mock();raw.read_word_data.side_effect=[0,0,0x1208]
+        bus=PacedBus(raw)
+        with patch('touch_collector.hardware.time.monotonic',side_effect=lambda:clock.t),patch('touch_collector.hardware.time.sleep',side_effect=clock.sleep):
+            bus.write_byte_data(0x15,0x36,0)
+            self.assertEqual(bus.read_word_data(0x15,0x36),0)
+        raw.write_byte_data.assert_called_once_with(0x15,0x36,0)
+        self.assertEqual(raw.read_word_data.call_count,1)
+        self.assertEqual(bus.feedback_trace[-1]['words'],[0])
+        raw.write_i2c_block_data.assert_not_called()
+
+    def test_failed_sdk_queries_retry_with_fresh_queries_and_increasing_waits(self):
+        class Clock:
+            t=1.
+            def sleep(self,n):self.t+=max(0,n)
+        clock=Clock();raw=Mock();raw.read_word_data.return_value=0;bus=PacedBus(raw)
+        arm=Mock();arm.addr=0x15;arm.bus=bus
+        attempts=[]
+        def sdk_read(j):
+            bus.write_byte_data(0x15,0x30+j,0)
+            value=bus.read_word_data(0x15,0x30+j)
+            if j==6:
+                attempts.append(bus.reply_wait)
+                return 100 if len(attempts)==3 else None
+            return 90
+        arm.Arm_serial_servo_read.side_effect=sdk_read
+        robot=RealRobot.__new__(RealRobot);robot.arm=arm
+        with patch('touch_collector.hardware.time.monotonic',side_effect=lambda:clock.t),patch('touch_collector.hardware.time.sleep',side_effect=clock.sleep):
+            start=clock.t
+            self.assertEqual(robot.read(),[90,90,90,90,90,100])
+            self.assertLess(clock.t-start,.100)
+        self.assertEqual(attempts,[.003,.006,.010])
+        self.assertEqual(raw.read_word_data.call_count,8)
+        self.assertEqual(raw.write_byte_data.call_count,8)
+        self.assertEqual([t['requested_wait_ms'] for t in robot.last_feedback_io if t['joint']==6],[3,6,10])
+        self.assertTrue(all(len(t['words'])==1 for t in robot.last_feedback_io))
+        self.assertIsNone(bus.reply_deadline)
+        self.assertEqual(bus.reply_wait,.003)
+
+    def test_nonzero_reply_is_not_reinterpreted_or_polled(self):
+        raw=Mock();raw.read_word_data.return_value=65535;bus=PacedBus(raw)
+        with patch('touch_collector.hardware.time.sleep'):
+            bus.write_byte_data(0x15,0x36,0)
+            self.assertEqual(bus.read_word_data(0x15,0x36),65535)
+        self.assertEqual(raw.read_word_data.call_count,1)
+
+    def test_unrelated_or_unrequested_zero_read_is_not_polled(self):
+        raw=Mock();raw.read_word_data.return_value=0;bus=PacedBus(raw)
+        with patch('touch_collector.hardware.time.sleep'):
+            self.assertEqual(bus.read_word_data(0x15,0x36),0)
+            bus.write_byte_data(0x15,0x35,0)
+            self.assertEqual(bus.read_word_data(0x15,0x36),0)
+        self.assertEqual(raw.read_word_data.call_count,2)
+
+    def test_pose_read_deadline_never_causes_additional_register_reads(self):
+        raw=Mock();raw.read_word_data.return_value=0;bus=PacedBus(raw)
+        with patch('touch_collector.hardware.time.sleep'):
+            bus.write_byte_data(0x15,0x36,0)
+            bus.reply_deadline=time.monotonic()-1
+            self.assertEqual(bus.read_word_data(0x15,0x36),0)
+        self.assertEqual(raw.read_word_data.call_count,1)
+
+    def test_bus_io_exception_is_preserved_and_traced(self):
+        raw=Mock();raw.read_word_data.side_effect=OSError('bus fault');bus=PacedBus(raw)
+        with patch('touch_collector.hardware.time.sleep'):
+            bus.write_byte_data(0x15,0x36,0)
+            with self.assertRaises(OSError):bus.read_word_data(0x15,0x36)
+        self.assertEqual(raw.read_word_data.call_count,1)
+        self.assertEqual(bus.feedback_trace[-1]['io_error'],'OSError')
+
+    def test_slow_state_read_stops_before_sending_new_position(self):
+        class Clock:
+            t=1.
+            def sleep(self,n):self.t+=max(0,n)
+        clock=Clock();pose=self.robot.pose[:]
+        def slow_read():clock.t+=.250;return pose[:]
+        with patch('touch_collector.core.time.monotonic',side_effect=lambda:clock.t),patch('touch_collector.core.time.monotonic_ns',side_effect=lambda:int(clock.t*1e9)),patch('touch_collector.core.time.sleep',side_effect=clock.sleep),patch.object(self.robot,'read',side_effect=slow_read):
+            with self.assertRaisesRegex(RuntimeError,'关节读取导致控制延迟'):
+                self.e._motion([pose,pose])
+        self.assertEqual(self.robot.writes+self.robot.torques,[])
 
     def test_delete_is_reversible_and_never_changes_hardware(self):
         self.install_teaching()

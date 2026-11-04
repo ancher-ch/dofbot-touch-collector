@@ -12,16 +12,28 @@ from trajectory_teach import valid_pose, near_pose, prepare_plan, save_json
 from .hardware import FeedbackError
 from .storage import Store, Capture, load, identifier
 from .safety import EmergencyLatch
+from .tasks import DEFAULT_TASKS, task_name, task_choices
+from .tracking import command_bounds, failed_joints, failure_text
+from .camera import CameraFrameError
 
 
-def home_plan(start, target, duration=4.5, max_speed=30.0, max_acceleration=90.0):
-    """Quintic interpolation. These are software limits, not motor ratings."""
+def home_plan(start, target, duration=None, max_speed=30.0, max_acceleration=90.0):
+    """Time-scale the existing quintic to the span, never to a five-second cap.
+
+    ``duration`` optionally requests a minimum duration; limits may lengthen it.
+    The one-second floor avoids abrupt short moves. Limits are software policy,
+    not motor ratings or collision avoidance. Execution remains at 10 Hz.
+    """
     start, target = valid_pose(start), valid_pose(target)
+    for name, value in (("速度", max_speed), ("加速度", max_acceleration)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"回位{name}限制必须为有限正数，未执行。")
+    if duration is not None and (isinstance(duration, bool) or not isinstance(duration, (int, float)) or
+                                 not math.isfinite(duration) or duration <= 0):
+        raise ValueError("回位请求时间必须为有限正数，未执行。")
     span = max(abs(a-b) for a,b in zip(start,target))
     required = max(1.875 * span / max_speed, math.sqrt(5.774 * span / max_acceleration))
-    if required > duration:
-        raise ValueError(f"当前跨度需至少{required:.1f}秒，超出5秒回位窗口；未执行。请分段调整起点。")
-    count = math.ceil(duration * 10)
+    count = math.ceil(max(1.0, duration or 0.0, required) * 10)
     result = []
     for i in range(count + 1):
         u = i / count
@@ -42,8 +54,8 @@ def compensated_teaching(document, extra_degrees=0):
     For this manufacturer's gripper, increasing the angle closes the fingers.
     This is a position correction, not a measurement or guarantee of grip force.
     """
-    if type(extra_degrees) is not int or extra_degrees not in (0,1,2):
-        raise ValueError("夹爪夹紧补偿只能选0°、1°或2°。")
+    if type(extra_degrees) is not int or extra_degrees not in range(6):
+        raise ValueError("夹爪夹紧补偿只能选0°到5°的整数。")
     if not extra_degrees:
         return document, {"strategy":"disabled","max_extra_degrees":0}
     rows=document.get("samples",[])
@@ -69,13 +81,34 @@ def compensated_teaching(document, extra_degrees=0):
     return result,policy
 
 
-def teaching_plan(document, gripper_extra_degrees=0):
+def joint3_corrected_teaching(document, offset_degrees=0):
+    """Optional constant position correction, not torque/gravity compensation."""
+    if type(offset_degrees) is not int or not -3 <= offset_degrees <= 3:
+        raise ValueError("J3位置微调只能选-3°到+3°的整数。")
+    policy = {"joint":3, "offset_degrees":offset_degrees, "unit":"degree",
+              "strategy":"constant_position_offset" if offset_degrees else "disabled",
+              "gravity_compensation":False,"force_control":False,
+              "scope":"replay_and_its_first_pose_only; saved_global_home_unchanged"}
+    if not offset_degrees:
+        return document, policy
+    result = copy.deepcopy(document)
+    for row in result["samples"]:
+        pose = valid_pose(row["q"])
+        if not 0 <= pose[2]+offset_degrees <= 180:
+            raise ValueError("J3位置微调后超出0°～180°，未执行；请减小微调，不会自动裁切。")
+        row["q"] = pose[:]
+        row["q"][2] += offset_degrees
+    return result, policy
+
+
+def teaching_plan(document, gripper_extra_degrees=0, joint3_offset_degrees=0):
     if document.get("quality_warnings") and not document.get("warnings_reviewed"):
         raise ValueError("本条包含快速变化，需先审核并保存人工示教。")
     # Validate the untouched trajectory first; a correction cannot mask bad data.
     plan=prepare_plan(document,max_samples=1201,max_replay_seconds=600,
                         max_sample_step=None,segment_retime=True)
-    adjusted,_=compensated_teaching(document,gripper_extra_degrees)
+    positioned,_=joint3_corrected_teaching(document,joint3_offset_degrees)
+    adjusted,_=compensated_teaching(positioned,gripper_extra_degrees)
     return plan if adjusted is document else prepare_plan(adjusted,max_samples=1201,max_replay_seconds=600,
                                                          max_sample_step=None,segment_retime=True)
 
@@ -107,7 +140,20 @@ class Engine:
         self.last_feedback_event = 0
         self.message = "先查看关节，设置初始状态。启动不会自动运动。"
         self.error = ""
-        self.task = "把方块抓起放进固定盒子"
+        self.task = DEFAULT_TASKS[0]
+        self.task_history = []
+        task_config = self.store.root / "task_config.json"
+        if task_config.exists():
+            try:
+                config = load(task_config)
+                self.task = task_name(config["current"])
+                recent = config.get("recent", [])
+                if not isinstance(recent, list):
+                    raise ValueError("任务历史格式无效。")
+                self.task_history = task_choices(self.task, recent)
+            except (OSError, ValueError, TypeError, KeyError):
+                self.task = DEFAULT_TASKS[0]
+                self.task_history = []
         self.home = None
         self.home_setup_previous = None
         self.home_candidate = None
@@ -118,6 +164,8 @@ class Engine:
         self.elapsed = 0.0
         self.progress = 0.0
         self.preview = None
+        self.preview_frames = {}
+        self.preview_errors = {}
         self.camera_error = ""
         self.last_preview = 0
         config = self.store.root / "home.json"
@@ -168,7 +216,8 @@ class Engine:
                     "boundary_joints": [i+1 for i,x in enumerate(self.pose) if x is not None and
                                         min(x,(270 if i==4 else 180)-x)<10],
                     "home": copy.deepcopy(self.home), "message": self.message, "error": self.error,
-                    "task": self.task, "elapsed": self.elapsed, "progress": self.progress,
+                    "task": self.task, "task_history": task_choices(self.task, self.task_history),
+                    "elapsed": self.elapsed, "progress": self.progress,
                     "samples": len(self.teaching["samples"]) if self.teaching else 0,
                     "teaching_id": self.teaching["id"] if self.teaching else None,
                     "teaching_saved": bool(self.teaching and self.teaching["status"] == "recorded"),
@@ -180,14 +229,16 @@ class Engine:
                     "capture_status": self.capture.meta["status"] if self.capture else None,
                     "capture_success": self.capture.meta.get("operator_success") if self.capture else None,
                     "preview": self.preview, "camera_error": self.camera_error,
+                    "preview_frames":dict(self.preview_frames),"preview_errors":dict(self.preview_errors),
                     "camera_status":self.camera.status() if self.camera and hasattr(self.camera,"status") else None,
                     "library": self.store.list_items("teachings"),
                     "saved_episodes": len([x for x in self.store.list_items("episodes") if x["status"] == "saved"]),
                     "root": str(self.store.root), "demo": self.demo}
 
-    def refresh(self):
+    def refresh(self, bounds=None):
         try:
-            p = valid_pose(self.robot.read())
+            p = valid_pose(self.robot.read_with_bounds(bounds) if bounds is not None and
+                           hasattr(self.robot, "read_with_bounds") else self.robot.read())
         except FeedbackError as error:
             with self.lock:
                 self.pose = error.pose
@@ -200,7 +251,8 @@ class Engine:
                 if self.feedback_since is None:
                     self.feedback_since = self.read_at
                 if self.read_at-self.last_feedback_event >= 5 or self.feedback_failures == 1:
-                    self.event("feedback_invalid", detail=str(error), reasons=error.reasons)
+                    self.event("feedback_invalid", detail=str(error), reasons=error.reasons,
+                               sdk_io=getattr(self.robot,"last_feedback_io",[]))
                     self.last_feedback_event = self.read_at
             raise
         except Exception:
@@ -223,6 +275,9 @@ class Engine:
             self.feedback_reasons = [None]*6
             self.feedback_failures = 0
             self.feedback_since = None
+            waited=[r for r in getattr(self.robot,"last_feedback_io",[]) if r.get("requested_wait_ms",3)>3]
+            if waited:
+                self.event("feedback_reply_retry", queries=waited)
         return p
 
     def event(self, name, **details):
@@ -259,6 +314,19 @@ class Engine:
             raise RuntimeError("当前操作尚未结束。")
         if self.stage == "home_setup" and not allow_home_setup:
             raise RuntimeError("先完成或取消初始位置设置。")
+
+    def set_task(self, task):
+        self._idle()
+        if self.stage not in ("ready", "prepare") or self.teaching is not None or self.capture is not None:
+            raise RuntimeError("已有示教或采集数据时不能改任务；请先保存/删除当前数据，再选择下一条。")
+        value = task_name(task)
+        history = task_choices(value, self.task_history)
+        # Persist first: a disk error must not display a name that wasn't saved.
+        save_json(self.store.root / "task_config.json", {"current": value, "recent": history})
+        self.task = value
+        self.task_history = history
+        self.message = "任务名称已保存：" + value
+        self.event("task_changed", task=value)
 
     @staticmethod
     def require(confirmed):
@@ -621,21 +689,35 @@ class Engine:
                 if time.monotonic()-scheduled > .2:
                     raise RuntimeError("等待相机导致延迟超过200ms，未发送本次目标。")
             read_start = time.monotonic_ns()
-            actual = self.refresh()
+            bounds, recent, issued = command_bounds(history, time.monotonic())
+            actual = self.refresh(bounds)
             read_end = time.monotonic_ns()
-            recent=[q for stamp,q in history if tick-stamp<=.45]
-            if not recent:
-                recent=[history[-1][1]]
+            rechecks = getattr(self.robot, "last_read_rechecks", [])
+            if rechecks:
+                self.event("motion_feedback_rechecked", step=i, checks=rechecks,
+                           motion_kind="replay_capture" if recording is not None else "return_home")
             envelope_ok=all(min(q[j] for q in recent)-3 <= actual[j] <= max(q[j] for q in recent)+3 for j in range(6))
-            relative_ok=near_pose(actual,target,12)
+            # State is read BEFORE this tick's command. Comparing it with the
+            # pending target adds one step to measured lag and causes false trips.
+            relative_ok=near_pose(actual,issued,12)
             if not envelope_ok or not relative_ok:
+                axes = failed_joints(actual, bounds)
                 self.event("motion_tracking_failed",step=i,actual=actual,previous_target=previous,
                            target=target,elapsed=tick-begun,recent_commands=recent,
-                           envelope_ok=envelope_ok,relative_ok=relative_ok)
-                raise RuntimeError("反馈偏离目标，已停止后续指令。"+f"实际{actual}，上次目标{previous}，本次目标{target}。")
+                           envelope_ok=envelope_ok,relative_ok=relative_ok,issued_target=issued,
+                           failed_axes=[j+1 for j in axes],feedback_bounds=bounds,
+                           motion_kind="replay_capture" if recording is not None else "return_home")
+                raise RuntimeError(failure_text(actual, issued, target, axes))
             max_camera_age=getattr(self.camera,"max_recording_age_ms",200)
-            if recording and not 0 <= (read_start-camera_sample[1])/1e6 <= max_camera_age:
-                raise RuntimeError("相机帧过旧，未发送本次目标。")
+            if recording:
+                for role,sample in getattr(camera_sample,'views',{'wrist':camera_sample}).items():
+                    if not 0 <= (read_start-sample[1])/1e6 <= max_camera_age:
+                        raise CameraFrameError('相机帧过旧，未发送本次目标',
+                            {'observed_monotonic_ns':read_start,'sequence':sample[0],
+                             'frame_receive_monotonic_ns':sample[1],
+                             'frame_age_ms':(read_start-sample[1])/1e6,'max_age_ms':max_camera_age},role)
+            if time.monotonic()-scheduled > .2:
+                raise RuntimeError("关节读取导致控制延迟超过200ms，未发送本次目标。")
             self.check_stop()
             command_sent = last_sent != target
             write_start = write_end = None
@@ -644,7 +726,7 @@ class Engine:
                 self.robot.write(target, 100)
                 write_end = time.monotonic_ns()
                 last_sent = target[:]
-                history.append((tick,target[:]))
+                history.append((write_end/1e9,target[:]))
             if recording:
                 recording.add(camera_sample, actual, last_sent, read_start, read_end, write_start, write_end, tick,
                               command_sent=command_sent)
@@ -655,9 +737,31 @@ class Engine:
             self.progress = (i+1)/len(targets)
             self.elapsed = tick-begun
             scheduled = self.camera.next_recording_tick(camera_sample) if recording and hasattr(self.camera,"next_recording_tick") else begun+(i+1)/10
-        time.sleep(.25)
-        if not near_pose(self.refresh(), targets[-1], 2):
-            raise RuntimeError("动作结束后仍未到达目标附近，保留为异常。")
+        goal = targets[-1]
+        goal_bounds = [(q-2, q+2) for q in goal]
+        if recording is None:
+            # No new position command during settling. Bound the observation
+            # window and continue checking stop/emergency every <=100 ms.
+            stable = 0
+            for attempt in range(16):
+                self.check_stop()
+                actual = self.refresh(goal_bounds)
+                stable = stable+1 if near_pose(actual, goal, 2) else 0
+                if stable >= 2:
+                    return
+                if attempt < 15:
+                    time.sleep(.1)
+            self.event("motion_goal_failed", actual=actual, target=goal,
+                       failed_axes=[j+1 for j in failed_joints(actual, goal_bounds)],
+                       motion_kind="return_home", observation_window_s=1.5)
+        else:
+            time.sleep(.25)
+            self.check_stop()
+            actual = self.refresh(goal_bounds)
+            if near_pose(actual, goal, 2):
+                return
+        raise RuntimeError("动作结束后仍未到达目标附近，保留为异常。"+
+                           failure_text(actual, goal, goal, failed_joints(actual, goal_bounds)))
 
     def _countdown(self):
         for n in range(3,0,-1):
@@ -683,24 +787,30 @@ class Engine:
             self.message = "当前已经在初始状态附近，没有发送运动指令。"
             return
         plan = home_plan(start, destination)
+        planned_seconds = (len(plan)-1)/10
+        destination_name = "本条示教起点" if target_pose is not None else "初始状态"
+        self.event("return_home_plan", start=start, target=destination, planned_duration_s=planned_seconds,
+                   max_speed_deg_s=30.0, max_acceleration_deg_s2=90.0, fixed_time_limit=False)
         self.activity = "returning"
         try:
             if countdown:
                 self._countdown()
             # Human could have moved the arm during the countdown; never replan silently.
+            self.message = f"正在平滑回位，计划运动约{planned_seconds:.1f}秒；按距离自动定时，不因超过5秒取消。"
             self._motion(plan)
-            self.message = "已回到初始状态。请求运动4.5秒，稳定检查后完成；未开始采集。"
+            self.message = f"已回到{destination_name}。计划运动{planned_seconds:.1f}秒，稳定检查完成；未开始采集。"
         finally:
             self.activity = "idle"
 
-    def replay_capture(self, confirmed=False, gripper_extra_degrees=0):
+    def replay_capture(self, confirmed=False, gripper_extra_degrees=0, joint3_offset_degrees=0):
         self.require(confirmed)
         self._idle()
         self._power_required()
         if not self.teaching or self.teaching["status"] != "recorded":
             raise RuntimeError("先保存或选择一条完整人工示教。")
-        plan, scale = teaching_plan(self.teaching,gripper_extra_degrees)
+        plan, scale = teaching_plan(self.teaching,gripper_extra_degrees,joint3_offset_degrees)
         _,gripper_policy=compensated_teaching(self.teaching,gripper_extra_degrees)
+        _,joint3_policy=joint3_corrected_teaching(self.teaching,joint3_offset_degrees)
         if self.camera is None:
             raise RuntimeError("相机未连接。")
         self.camera.get()
@@ -719,7 +829,8 @@ class Engine:
             self.capture = Capture(self.store, self.teaching, self.cv2)
             self.persist()
             self.capture.meta.update(replay_time_scale=scale, simulated=self.demo,
-                                     gripper_compensation=gripper_policy)
+                                     gripper_compensation=gripper_policy,
+                                     joint3_position_correction=joint3_policy)
             if hasattr(self.camera,"status"):
                 camera_status=self.camera.status()
                 self.capture.meta.update(camera_configuration=camera_status,
@@ -743,6 +854,8 @@ class Engine:
             self.message = "完整采集草稿已生成。可重放重录、删除人工示教，或保存此次数据。"
         except BaseException as error:
             if self.capture and self.capture.meta["status"] not in ("saved", "draft"):
+                if hasattr(error,'diagnostics'):
+                    self.capture.meta['camera_failure_diagnostics']=error.diagnostics
                 self.capture.finish("interrupted" if isinstance(error,Stopped) else "error", str(error))
             self.stage = "capture_review" if self.capture else "saved_teach"
             raise
@@ -782,6 +895,25 @@ class Engine:
             return
         try:
             # LatestCamera's background thread owns VideoCapture. No UI thread reads a device.
+            if hasattr(self.camera,'preview_views'):
+                views,errors=self.camera.preview_views()
+                frames={}
+                for role,sample in views.items():
+                    image=sample[2]
+                    # Encode only the display resolution. Recording retains the
+                    # original full-resolution frames and timestamps.
+                    dual=getattr(self.camera,'config',{}).get('mode')=='dual'
+                    max_width,max_height=(320,240) if dual else (480,360)
+                    height,width=image.shape[:2]
+                    ratio=min(1,max_width/width,max_height/height)
+                    if ratio<1:image=self.cv2.resize(image,(round(width*ratio),round(height*ratio)))
+                    ok,data=self.cv2.imencode('.jpg',image,[self.cv2.IMWRITE_JPEG_QUALITY,75])
+                    if ok:frames[role]=data.tobytes()
+                    else:errors[role]='相机预览编码失败。'
+                self.preview_frames=frames;self.preview_errors=errors
+                self.preview=frames.get('wrist')
+                self.camera_error='；'.join(f'{role}: {message}' for role,message in errors.items())
+                return
             if hasattr(self.camera,'preview_sample'):
                 sample=self.camera.preview_sample()
             elif hasattr(self.camera, "condition"):
@@ -802,8 +934,10 @@ class Engine:
                 self.camera_error = ""
         except Exception as error:
             self.preview = None
+            self.preview_frames={};self.preview_errors={'wrist':str(error)}
             self.camera_error = str(error)
-        self.last_preview = time.monotonic()
+        finally:
+            self.last_preview = time.monotonic()
 
     def reset_emergency(self,confirmed=False):
         self.require(confirmed)
@@ -825,7 +959,9 @@ class Engine:
             except OSError as storage_error:
                 self.message += "；异常草稿写入失败："+str(storage_error)
         self.activity = "idle"
-        self.event("operation_failed", detail=str(error))
+        details={'detail':str(error)}
+        if hasattr(error,'diagnostics'):details['camera_failure_diagnostics']=error.diagnostics
+        self.event("operation_failed", **details)
 
     def close(self):
         if self.stage == "teaching":

@@ -1,19 +1,22 @@
 """Select named RGB streams; metadata nodes are filtered before this dialog."""
 from PyQt5 import QtWidgets as W
+from pathlib import Path
 
 class CameraDialog(W.QDialog):
     def __init__(self,devices,config,parent=None,emergency=None):
         super().__init__(parent)
         self.setWindowTitle('单摄 / 双摄配置');self.resize(700,450)
         layout=W.QVBoxLayout(self)
-        text=W.QLabel('单摄只采集腕部RGB；双摄同时采集腕部和外部RGB。\n每路独立读取并记录时间戳，不是硬件触发同步。元数据节点不是第二台摄像头。')
+        text=W.QLabel('双摄会在主界面同时显示两路彩色画面，并在回放采集时保存两路RGB。\n每路独立读取并记录时间戳，不是硬件触发同步；深度、红外和元数据节点不在此选择。')
         text.setWordWrap(True);layout.addWidget(text)
         self.mode=W.QComboBox();self.mode.addItems(['单摄','双摄']);self.mode.setCurrentIndex(int(config['mode']=='dual'));layout.addWidget(self.mode)
         self.choices={}
         for role,title in (('wrist','腕部 / 主相机'),('overview','外部 / 第二相机')):
             layout.addWidget(W.QLabel(title));combo=W.QComboBox()
             for device in devices:combo.addItem(device['card']+' · '+device['node'],device['path'])
-            index=combo.findData(config.get(role));combo.setCurrentIndex(index if index>=0 else min(1 if role=='overview' else 0,combo.count()-1))
+            selected=config.get(role)
+            index=next((i for i,d in enumerate(devices) if selected and Path(d['path']).resolve()==Path(selected).resolve()),-1)
+            combo.setCurrentIndex(index if index>=0 else min(1 if role=='overview' else 0,combo.count()-1))
             self.choices[role]=combo;layout.addWidget(combo)
         self.support=W.QCheckBox('机械臂已抱紧或可靠固定，没有运动、示教或采集在进行')
         layout.addWidget(self.support)
